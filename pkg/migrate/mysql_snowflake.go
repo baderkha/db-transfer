@@ -41,7 +41,10 @@ func NewMysqlToSnowflake() *MysqlToSnowflake {
 		panic(err)
 
 	}
-
+	b, err := os.ReadFile("resources/safe_col_mysql_snowflake.sql")
+	if err != nil {
+		panic(err)
+	}
 	// Create a new S3 client
 	return &MysqlToSnowflake{
 		runId:                  uid.String(),
@@ -49,6 +52,7 @@ func NewMysqlToSnowflake() *MysqlToSnowflake {
 		errWriteList:           make(chan error),
 		fs:                     afero.NewOsFs(),
 		targetFs:               s3.New(sess),
+		safeCastQuery:          string(b),
 	}
 }
 
@@ -78,16 +82,59 @@ type MysqlToSnowflake struct {
 	tmpDirPrefix           string
 	s3DirPrefix            string
 	runId                  string
+	safeCastQuery          string
+	safeCols               map[string][]SafeColTypes
 	fs                     afero.Fs
 }
 
 func (m *MysqlToSnowflake) Init(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snowflake]) {
 	m.cfg = cfg
-	m.source = connection.DialMysql(&cfg.SourceConfig, cfg.MaxConcurrency)
-	m.target = nil
+	m.source = connection.DialMysql(cfg.SourceConfig.GetDSN(), cfg.MaxConcurrency)
+	m.target = connection.DialSnowflake(cfg.Target.GetDSN())
 	m.infoFetcher = table.NewInfoFetcherMysql(m.source)
 	m.tmpDirPrefix = filepath.Join(conditional.Ternary(os.Getenv("WRITE_DIR") != "", os.Getenv("WRITE_DIR"), "./tmp"), "date="+time.Now().Format(time.DateOnly), "run_id="+m.runId)
 	m.s3DirPrefix = filepath.Join(conditional.Ternary(m.cfg.Target.S3.PrefixOverride != "", m.cfg.Target.S3.PrefixOverride, "./mysql_snowflake_migration"), "date="+time.Now().Format(time.DateOnly), "run_id="+m.runId)
+
+}
+
+// table_schema as db_name,
+//
+//						table_name as tb_name,
+//						column_name AS column_name,
+//	                  data_type AS data_type,
+//	                  column_type AS column_type,
+//	                  safe_sql_value AS safe_sql_value
+type SafeColTypes struct {
+	DBName     string
+	TableName  string
+	ColumnName string
+	DataType   string
+	ColumnType string
+	SafeSQL    string
+}
+
+func (m *MysqlToSnowflake) GetSafeColTypes() (map[string][]SafeColTypes, error) {
+	var (
+		res map[string][]SafeColTypes = make(map[string][]SafeColTypes)
+	)
+
+	rows, err := m.source.Query(m.safeCastQuery)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var sct SafeColTypes
+		err = rows.Scan(&sct.DBName, &sct.TableName, &sct.ColumnName, &sct.DataType, &sct.ColumnType, &sct.SafeSQL)
+		if err != nil {
+			return nil, err
+		}
+		res[sct.DBName+"."+sct.TableName] = append(res[sct.DBName+"."+sct.TableName], sct)
+	}
+	if rows.Err() != nil {
+		return nil, rows.Err()
+	}
+
+	return res, nil
 }
 
 func (m *MysqlToSnowflake) Run(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snowflake]) error {
@@ -117,6 +164,12 @@ func (m *MysqlToSnowflake) Run(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snow
 		return err
 	}
 
+	safeCols, err := m.GetSafeColTypes()
+	if err != nil {
+		return err
+	}
+	m.safeCols = safeCols
+
 	err = m.GenerateTargetTables(allTableInfo)
 	if err != nil {
 		return err
@@ -134,6 +187,7 @@ func (m *MysqlToSnowflake) Run(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snow
 	if err != nil {
 		return err
 	}
+	fmt.Println("finished streaming tables")
 	m.ShutSflakeDownWorkers()
 	sflakeWg.Wait() // wait once the other is done
 	return nil
@@ -165,8 +219,9 @@ func (m *MysqlToSnowflake) HandleTableDump(a *table.Info) error {
 		wg              errgroup.Group
 	)
 	wg.SetLimit(m.cfg.MaxConcurrency)
-	for _, col := range a.Schema {
-		cols = append(cols, WrapQ(col.ColumnName))
+	safeCols := m.safeCols[a.DatabaseName+"."+a.TableName]
+	for _, col := range safeCols {
+		cols = append(cols, col.SafeSQL)
 	}
 
 	_ = m.fs.MkdirAll(prefix, 0755)
@@ -246,12 +301,14 @@ func (m *MysqlToSnowflake) HandleTableDump(a *table.Info) error {
 	if err != nil {
 		return err
 	}
+	fmt.Println("here before publish " + a.TableName + " " + a.DatabaseName)
 	// done processing this table
 	m.PublishSnowflakeWriteEv(snowflakeTargetEv{
 		TableToWriteTo:         a.TableName,
 		SchemaToWriteTo:        a.DatabaseName,
 		S3OPrefixPathWrittenTo: filepath.Join(m.s3DirPrefix, subPrefix),
 	})
+	fmt.Println("here after publish " + a.TableName + " " + a.DatabaseName)
 	return nil
 }
 
@@ -275,6 +332,9 @@ func (em *MysqlToSnowflake) OnSnowflakeCSVFileEv(workerID int, wg *sync.WaitGrou
 			return
 		}
 		fmt.Printf("Worker %d received event: %v\n", workerID, event)
+		time.Sleep(1 * time.Second)
+		fmt.Printf("Worker %d finished processing event: %v\n", workerID, event)
+
 	}
 }
 

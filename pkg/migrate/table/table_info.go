@@ -7,9 +7,10 @@ type TableInformation struct {
 }
 
 type ColumnTypes struct {
-	ColumnName string `db:"col_name"`
-	Type       string `db:"col_type"`
-	TargetType string `db:"target_type"`
+	ColumnName    string `db:"col_name"`
+	Type          string `db:"col_type"`
+	TargetType    string `db:"target_type"`
+	TargetColName string `db:"target_col_name"`
 }
 
 type Index struct {
