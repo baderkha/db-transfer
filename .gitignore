@@ -1,2 +1,4 @@
 tmp
 *.csv
+local/*
+main1.go
