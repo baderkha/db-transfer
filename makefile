@@ -1,3 +1,3 @@
 
 start:
-	go run cmd/local/main.go
+	go run --race cmd/local/main.go
