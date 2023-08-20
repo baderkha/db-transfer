@@ -12,6 +12,7 @@ type MYSQL struct {
 	Password              string            `json:"password"`
 	Port                  int               `json:"port"`
 	DB                    string            `json:"db"`
+	QueryLogging          bool              `json:"query_log"`
 }
 
 func (m *MYSQL) GetDSN() string {

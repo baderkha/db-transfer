@@ -6,14 +6,16 @@ import (
 	_ "github.com/snowflakedb/gosnowflake"
 )
 
-func DialSnowflake(dsn string) *sql.DB {
+func DialSnowflake(dsn string, qlog bool) *sql.DB {
 	var res string
 	db, err := sql.Open("snowflake", dsn)
 	if err != nil {
 		panic(err)
 	}
 
-	db = AddLogger(db, dsn)
+	if qlog {
+		db = AddLogger(db, dsn, "snowflake")
+	}
 	row := db.QueryRow("SELECT 1")
 
 	if row.Err() != nil {

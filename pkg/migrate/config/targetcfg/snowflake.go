@@ -15,6 +15,7 @@ type Snowflake struct {
 	Warehouse       string    `json:"ware_house"`
 	Role            string    `json:"role"`
 	S3              S3Options `json:"s3"`
+	QueryLogging    bool      `json:"query_log"`
 }
 
 func (s *Snowflake) GetDSN() string {

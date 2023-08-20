@@ -89,8 +89,8 @@ type MysqlToSnowflake struct {
 
 func (m *MysqlToSnowflake) Init(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snowflake]) {
 	m.cfg = cfg
-	m.source = connection.DialMysql(cfg.SourceConfig.GetDSN(), cfg.MaxConcurrency)
-	m.target = connection.DialSnowflake(cfg.Target.GetDSN())
+	m.source = connection.DialMysql(cfg.SourceConfig.GetDSN(), cfg.MaxConcurrency, cfg.SourceConfig.QueryLogging)
+	m.target = connection.DialSnowflake(cfg.Target.GetDSN(), cfg.Target.QueryLogging)
 	m.infoFetcher = table.NewInfoFetcherMysql(m.source)
 	m.tmpDirPrefix = filepath.Join(conditional.Ternary(os.Getenv("WRITE_DIR") != "", os.Getenv("WRITE_DIR"), "./tmp"), "date="+time.Now().Format(time.DateOnly), "run_id="+m.runId)
 	m.s3DirPrefix = filepath.Join(conditional.Ternary(m.cfg.Target.S3.PrefixOverride != "", m.cfg.Target.S3.PrefixOverride, "./mysql_snowflake_migration"), "date="+time.Now().Format(time.DateOnly), "run_id="+m.runId)
