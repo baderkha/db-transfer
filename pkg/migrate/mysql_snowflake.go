@@ -9,7 +9,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 	"github.com/baderkha/db-transfer/pkg/conditional"
 	"github.com/baderkha/db-transfer/pkg/migrate/config"
@@ -29,12 +33,22 @@ func NewMysqlToSnowflake() *MysqlToSnowflake {
 	if err != nil {
 		panic(err)
 	}
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String("us-east-1"), // Specify your desired AWS region
+	})
+
+	if err != nil {
+		panic(err)
+
+	}
+
+	// Create a new S3 client
 	return &MysqlToSnowflake{
 		runId:                  uid.String(),
 		snowflakeWriteListener: make(chan snowflakeTargetEv),
 		errWriteList:           make(chan error),
 		fs:                     afero.NewOsFs(),
-		tmpDirPrefix:           filepath.Join(conditional.Ternary(os.Getenv("WRITE_DIR") != "", os.Getenv("WRITE_DIR"), "./tmp"), "date=", "run_id="+uid.String()),
+		targetFs:               s3.New(sess),
 	}
 }
 
@@ -47,11 +61,10 @@ func UnPrefixTableName(prefixedTName string) string {
 }
 
 type snowflakeTargetEv struct {
-	FilePathWritten string
-	TableToWriteTo  string
-	SchemaToWriteTo string
-	IsDone          bool
-	Die             bool
+	S3OPrefixPathWrittenTo string
+	TableToWriteTo         string
+	SchemaToWriteTo        string
+	Die                    bool
 }
 
 type MysqlToSnowflake struct {
@@ -63,6 +76,7 @@ type MysqlToSnowflake struct {
 	snowflakeWriteListener chan snowflakeTargetEv
 	errWriteList           chan error
 	tmpDirPrefix           string
+	s3DirPrefix            string
 	runId                  string
 	fs                     afero.Fs
 }
@@ -72,6 +86,8 @@ func (m *MysqlToSnowflake) Init(cfg config.Config[sourcecfg.MYSQL, targetcfg.Sno
 	m.source = connection.DialMysql(&cfg.SourceConfig, cfg.MaxConcurrency)
 	m.target = nil
 	m.infoFetcher = table.NewInfoFetcherMysql(m.source)
+	m.tmpDirPrefix = filepath.Join(conditional.Ternary(os.Getenv("WRITE_DIR") != "", os.Getenv("WRITE_DIR"), "./tmp"), "date="+time.Now().Format(time.DateOnly), "run_id="+m.runId)
+	m.s3DirPrefix = filepath.Join(conditional.Ternary(m.cfg.Target.S3.PrefixOverride != "", m.cfg.Target.S3.PrefixOverride, "./mysql_snowflake_migration"), "date="+time.Now().Format(time.DateOnly), "run_id="+m.runId)
 }
 
 func (m *MysqlToSnowflake) Run(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snowflake]) error {
@@ -141,11 +157,14 @@ func (m *MysqlToSnowflake) HandleTableDump(a *table.Info) error {
 		batchAt         = 0
 		ctr             = 0
 		currentFile     afero.File
-		prefix          = filepath.Join(m.tmpDirPrefix, a.DatabaseName, a.TableName)
+		subPrefix       = filepath.Join("db="+a.DatabaseName, "tb_name="+a.TableName)
+		prefix          = filepath.Join(m.tmpDirPrefix, subPrefix)
 		cols            []string
 		currentFileName string = fmt.Sprintf("%s_%d.csv", a.TableName, batchAt)
 		err             error
+		wg              errgroup.Group
 	)
+	wg.SetLimit(m.cfg.MaxConcurrency)
 	for _, col := range a.Schema {
 		cols = append(cols, WrapQ(col.ColumnName))
 	}
@@ -186,17 +205,27 @@ func (m *MysqlToSnowflake) HandleTableDump(a *table.Info) error {
 		if err != nil {
 			return err
 		}
+		isLastRow = !rows.Next()
 
 		if ctr >= m.cfg.BatchRecordSize || isLastRow {
 			csvWriter.Flush()
-			currentFile.Close()
-			finishedFilePath := filepath.Join(prefix, currentFileName)
-			m.PublishSnowflakeWriteEv(snowflakeTargetEv{
-				FilePathWritten: finishedFilePath,
-				TableToWriteTo:  a.TableName,
-				SchemaToWriteTo: a.DatabaseName,
-				IsDone:          false,
-			})
+			currentFile.Seek(0, 0)
+			oldFile := currentFile
+			currentFile = nil
+			wg.Go(func(s3Prefix string, subPrefix string, currentFileName string, cfg targetcfg.Snowflake) func() error {
+				return func() error {
+					defer oldFile.Close()
+					key := filepath.Join(s3Prefix, subPrefix, currentFileName)
+					_, err := m.targetFs.PutObject(&s3.PutObjectInput{
+						Bucket: &cfg.S3.Bucket,
+						Body:   oldFile,
+						Key:    &key,
+					})
+
+					return err
+				}
+			}(m.s3DirPrefix, subPrefix, currentFileName, m.cfg.Target))
+
 			if !isLastRow {
 				ctr = 0
 				batchAt += m.cfg.BatchRecordSize
@@ -208,14 +237,20 @@ func (m *MysqlToSnowflake) HandleTableDump(a *table.Info) error {
 				csvWriter = csv.NewWriter(currentFile)
 			}
 		}
-		isLastRow = !rows.Next()
+
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	err = wg.Wait()
+	if err != nil {
+		return err
+	}
 	// done processing this table
 	m.PublishSnowflakeWriteEv(snowflakeTargetEv{
-		IsDone: true,
+		TableToWriteTo:         a.TableName,
+		SchemaToWriteTo:        a.DatabaseName,
+		S3OPrefixPathWrittenTo: filepath.Join(m.s3DirPrefix, subPrefix),
 	})
 	return nil
 }

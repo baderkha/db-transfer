@@ -24,7 +24,7 @@ func main() {
 		NewMysqlToSnowflake().
 		Run(config.Config[sourcecfg.MYSQL, targetcfg.Snowflake]{
 			MaxConcurrency:  8,
-			BatchRecordSize: 10000,
+			BatchRecordSize: 5,
 			SourceConfig: sourcecfg.MYSQL{
 				Host:     "127.0.0.1",
 				UserName: "root",
@@ -32,7 +32,11 @@ func main() {
 				Port:     6000,
 				DB:       "main",
 			},
-			Target: targetcfg.Snowflake{},
+			Target: targetcfg.Snowflake{
+				S3: targetcfg.S3Options{
+					Bucket: "aap-snowflake-job-dev",
+				},
+			},
 		}))
 	endTime := time.Now()
 
