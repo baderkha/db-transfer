@@ -10,6 +10,9 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 	"github.com/baderkha/db-transfer/pkg/conditional"
 	"github.com/baderkha/db-transfer/pkg/migrate/config"
@@ -21,7 +24,6 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/hashicorp/go-multierror"
 	"github.com/spf13/afero"
-	"golang.org/x/sync/errgroup"
 )
 
 func NewMysqlToSnowflake() *MysqlToSnowflake {
@@ -30,11 +32,15 @@ func NewMysqlToSnowflake() *MysqlToSnowflake {
 		panic(err)
 	}
 	return &MysqlToSnowflake{
-		runId:                  uid.String(),
-		snowflakeWriteListener: make(chan snowflakeTargetEv),
-		errWriteList:           make(chan error),
-		fs:                     afero.NewOsFs(),
-		tmpDirPrefix:           filepath.Join(conditional.Ternary(os.Getenv("WRITE_DIR") != "", os.Getenv("WRITE_DIR"), "./tmp"), "date=", "run_id="+uid.String()),
+		runId:         uid.String(),
+		csvWriteChan:  make(chan csvWrittenEv),
+		errWriteList:  make(chan error),
+		statusChan:    make(chan statusEv),
+		TableDumpChan: make(chan tableDumpEv),
+		fs:            afero.NewOsFs(),
+		tmpDirPrefix:  filepath.Join(conditional.Ternary(os.Getenv("WRITE_DIR") != "", os.Getenv("WRITE_DIR"), "./tmp"), "date=", "run_id="+uid.String()),
+		s3DirPrefix:   filepath.Join(conditional.Ternary(os.Getenv("S3_PREFIX") != "", os.Getenv("S3_PREFIX"), "./files"), "date=", "run_id="+uid.String()),
+		targetFs:      s3.New(session.Must(session.NewSession(aws.NewConfig()))),
 	}
 }
 
@@ -46,7 +52,7 @@ func UnPrefixTableName(prefixedTName string) string {
 	return strings.ReplaceAll(prefixedTName, "TEMP_MIGRATION_", "")
 }
 
-type snowflakeTargetEv struct {
+type csvWrittenEv struct {
 	FilePathWritten string
 	TableToWriteTo  string
 	SchemaToWriteTo string
@@ -54,17 +60,33 @@ type snowflakeTargetEv struct {
 	Die             bool
 }
 
+type tableDumpEv struct {
+	table.Info
+	Die bool
+}
+
+type statusEv struct {
+	HasCompletedTable bool
+	Err               error
+}
+
 type MysqlToSnowflake struct {
-	source                 *sql.DB
-	target                 *sql.DB
-	targetFs               s3iface.S3API
-	infoFetcher            table.InfoFetcher
-	cfg                    config.Config[sourcecfg.MYSQL, targetcfg.Snowflake]
-	snowflakeWriteListener chan snowflakeTargetEv
-	errWriteList           chan error
-	tmpDirPrefix           string
-	runId                  string
-	fs                     afero.Fs
+	source          *sql.DB
+	target          *sql.DB
+	targetFs        s3iface.S3API
+	infoFetcher     table.InfoFetcher
+	cfg             config.Config[sourcecfg.MYSQL, targetcfg.Snowflake]
+	TableDumpChan   chan tableDumpEv
+	csvWriteChan    chan csvWrittenEv
+	errWriteList    chan error
+	statusChan      chan statusEv
+	tablesCompleted int
+	tablesToDump    int
+	tmpDirPrefix    string
+	s3DirPrefix     string
+	runId           string
+	finalErr        error
+	fs              afero.Fs
 }
 
 func (m *MysqlToSnowflake) Init(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snowflake]) {
@@ -76,8 +98,9 @@ func (m *MysqlToSnowflake) Init(cfg config.Config[sourcecfg.MYSQL, targetcfg.Sno
 
 func (m *MysqlToSnowflake) Run(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snowflake]) error {
 	var (
-		sflakeWg sync.WaitGroup
-		sourceWg errgroup.Group
+		sflakeWg   sync.WaitGroup
+		sourceWg   sync.WaitGroup
+		fatalErrWg sync.WaitGroup
 	)
 	m.Init(cfg)
 	defer m.CleanUp()
@@ -85,9 +108,10 @@ func (m *MysqlToSnowflake) Run(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snow
 	if err != nil {
 		return err
 	}
-	sourceWg.SetLimit(m.cfg.MaxConcurrency)
 	// listener will be running in the bg waiting for files to be written
-	m.ListenToSnowflakeFiles(&sflakeWg)
+	m.ListToTableDumpEv(&sourceWg)
+	m.ListenToCSVWriteEv(&sflakeWg)
+	m.ListenToFatalErr(&fatalErrWg)
 
 	allTableInfo, err :=
 		m.
@@ -100,36 +124,44 @@ func (m *MysqlToSnowflake) Run(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snow
 	if err != nil {
 		return err
 	}
+	if len(allTableInfo) == 0 {
+		return nil
+	}
+	m.tablesToDump = len(allTableInfo)
+
+	for _, v := range allTableInfo {
+		m.PublishTableDumpEv(tableDumpEv{
+			Info: *v,
+			Die:  false,
+		})
+	}
 
 	err = m.GenerateTargetTables(allTableInfo)
 	if err != nil {
 		return err
 	}
 
-	for _, v := range allTableInfo {
-		sourceWg.Go(func(info *table.Info) func() error {
-			return func() error {
-				return m.HandleTableDump(info)
-			}
-		}(v))
-	}
-
-	err = sourceWg.Wait()
-	if err != nil {
-		return err
-	}
-	m.ShutSflakeDownWorkers()
-	sflakeWg.Wait() // wait once the other is done
-	return nil
+	sourceWg.Wait()
+	sflakeWg.Wait()
+	fatalErrWg.Wait()
+	return m.finalErr
 }
 
 func WrapQ(sql string) string {
 	return "`" + sql + "`"
 }
 
-func (m *MysqlToSnowflake) ShutSflakeDownWorkers() {
+func (m *MysqlToSnowflake) ShutDownCSVListener() {
 	for i := 0; i < m.cfg.MaxConcurrency; i++ {
-		m.PublishSnowflakeWriteEv(snowflakeTargetEv{
+		m.PublishCSVWriteEv(csvWrittenEv{
+			Die: true,
+		})
+	}
+}
+
+func (m *MysqlToSnowflake) ShutDownTableDumpListener() {
+	for i := 0; i < m.cfg.MaxConcurrency; i++ {
+		m.PublishTableDumpEv(tableDumpEv{
 			Die: true,
 		})
 	}
@@ -187,11 +219,12 @@ func (m *MysqlToSnowflake) HandleTableDump(a *table.Info) error {
 			return err
 		}
 
+		isLastRow = !rows.Next()
 		if ctr >= m.cfg.BatchRecordSize || isLastRow {
 			csvWriter.Flush()
 			currentFile.Close()
 			finishedFilePath := filepath.Join(prefix, currentFileName)
-			m.PublishSnowflakeWriteEv(snowflakeTargetEv{
+			m.PublishCSVWriteEv(csvWrittenEv{
 				FilePathWritten: finishedFilePath,
 				TableToWriteTo:  a.TableName,
 				SchemaToWriteTo: a.DatabaseName,
@@ -205,42 +238,145 @@ func (m *MysqlToSnowflake) HandleTableDump(a *table.Info) error {
 				if err != nil {
 					return err
 				}
+
 				csvWriter = csv.NewWriter(currentFile)
 			}
 		}
-		isLastRow = !rows.Next()
+
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
 	// done processing this table
-	m.PublishSnowflakeWriteEv(snowflakeTargetEv{
-		IsDone: true,
+	m.PublishCSVWriteEv(csvWrittenEv{
+		TableToWriteTo:  a.TableName,
+		SchemaToWriteTo: a.DatabaseName,
+		IsDone:          true,
 	})
 	return nil
 }
 
-func (m *MysqlToSnowflake) PublishSnowflakeWriteEv(event snowflakeTargetEv) {
-	m.snowflakeWriteListener <- event
+func (m *MysqlToSnowflake) PublishTableDumpEv(event tableDumpEv) {
+	m.TableDumpChan <- event
 }
 
-func (m *MysqlToSnowflake) ListenToSnowflakeFiles(wg *sync.WaitGroup) {
+func (m *MysqlToSnowflake) PublishCSVWriteEv(event csvWrittenEv) {
+	m.csvWriteChan <- event
+}
+
+func (m *MysqlToSnowflake) PublishStatusChangeEv(event statusEv) {
+	m.statusChan <- event
+}
+
+func (m *MysqlToSnowflake) ListenToFatalErr(wg *sync.WaitGroup) {
+	wg.Add(1)
+	go m.OnStatusChange(wg)
+}
+
+func (m *MysqlToSnowflake) ListenToCSVWriteEv(wg *sync.WaitGroup) {
 	for i := 1; i <= m.cfg.MaxConcurrency; i++ {
 		wg.Add(1)
-		go m.OnSnowflakeCSVFileEv(i, wg)
+		go m.OnCsvWritten(i, wg)
 	}
 }
 
-func (em *MysqlToSnowflake) OnSnowflakeCSVFileEv(workerID int, wg *sync.WaitGroup) {
+func (m *MysqlToSnowflake) ListToTableDumpEv(wg *sync.WaitGroup) {
+	for i := 1; i <= m.cfg.MaxConcurrency; i++ {
+		wg.Add(1)
+		go m.OnTableDump(i, wg)
+	}
+}
+
+func (em *MysqlToSnowflake) OnStatusChange(wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
-		event, ok := <-em.snowflakeWriteListener // Wait for an event to be published
+		event, ok := <-em.statusChan
+		if !ok || event.Err != nil || em.tablesCompleted == em.tablesToDump {
+			em.finalErr = event.Err
+			em.ShutDownTableDumpListener()
+			em.ShutDownCSVListener()
+			return
+		} else if event.HasCompletedTable {
+			em.tablesCompleted += 1
+		}
+	}
+}
+
+func (em *MysqlToSnowflake) OnTableDump(workerID int, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		event, ok := <-em.TableDumpChan // Wait for an event to be published
 		if !ok || event.Die {
 			fmt.Printf("Worker %d exiting\n", workerID)
 			return
 		}
-		fmt.Printf("Worker %d received event: %v\n", workerID, event)
+		err := em.HandleTableDump(&event.Info)
+		if err != nil {
+			em.PublishStatusChangeEv(statusEv{
+				HasCompletedTable: false,
+				Err:               err,
+			})
+
+		}
+
 	}
+}
+
+func (em *MysqlToSnowflake) OnCsvWritten(workerID int, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		event, ok := <-em.csvWriteChan // Wait for an event to be published
+		if !ok || event.Die {
+			fmt.Printf("Worker %d exiting\n", workerID)
+			return
+		}
+		if !event.IsDone {
+			var (
+				f afero.File
+			)
+			f, err := em.fs.Open(event.FilePathWritten)
+
+			if err != nil {
+				em.PublishStatusChangeEv(statusEv{
+					Err: err,
+				})
+				continue
+			}
+			defer f.Close()
+			err = em.UploadFile(f, em.cfg.Target.S3Bucket, filepath.Join(em.s3DirPrefix, filepath.Base(event.FilePathWritten)))
+			if err != nil {
+				em.PublishStatusChangeEv(statusEv{
+					Err: fmt.Errorf("%s.%s : %w", event.SchemaToWriteTo, event.TableToWriteTo, err)},
+				)
+				continue
+			}
+
+		} else {
+			em.PublishStatusChangeEv(statusEv{
+				HasCompletedTable: true,
+			})
+		}
+
+	}
+}
+
+func (em *MysqlToSnowflake) UploadFile(f afero.File, Bucket string, Key string) error {
+	var (
+		retryCtr int
+		err      error
+	)
+	for retryCtr < em.cfg.Target.MaxRetry {
+		_, err = em.targetFs.PutObject(&s3.PutObjectInput{
+			Body:   f,
+			Bucket: &em.cfg.Target.S3Bucket,
+			Key:    &Key,
+		})
+		if err == nil {
+			return nil
+		}
+		retryCtr++
+	}
+	return fmt.Errorf("Attemted uploading key (%s) %d times with no success this is a failure and will be treated as a fatal event : original_err=%w", Key, retryCtr+1, err)
 }
 
 func (m *MysqlToSnowflake) GenerateTargetTables(inf []*table.Info) error {
@@ -266,7 +402,7 @@ func (m *MysqlToSnowflake) GenerateTargetCast(inf []*table.Info) ([]*table.Info,
 }
 
 func (m *MysqlToSnowflake) CleanUp() {
-	defer close(m.snowflakeWriteListener)
+	defer close(m.csvWriteChan)
 	defer m.source.Close()
 	//defer m.target.Close()
 }
