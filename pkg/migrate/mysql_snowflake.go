@@ -220,6 +220,7 @@ func (m *MysqlToSnowflake) ShutSflakeDownWorkers() {
 }
 
 func (m *MysqlToSnowflake) HandleTableDump(a *table.Info) error {
+	fmt.Printf("STREAMING TABLE %s.%s \n", a.DatabaseName, a.TableName)
 	var (
 		result          []interface{}
 		batchAt         = 0
@@ -346,20 +347,22 @@ func (em *MysqlToSnowflake) OnSnowflakeCSVFileEv(workerID int, wg *sync.WaitGrou
 			return
 		}
 		fmt.Printf("Worker %d received event: %v\n", workerID, event)
-		_, _ = em.target.Exec(fmt.Sprintf(`
+		_, err := em.target.Exec(fmt.Sprintf(`
 			COPY INTO "%s.%s"
-			FROM %s/%s
+			FROM %s/%s/
 		`,
 			event.SchemaToWriteTo, TmpTablePfx(event.TableToWriteTo),
 			em.cfg.Target.Stage,
 			event.S3OPrefixPathWrittenTo,
 		))
-
-		em.target.Exec(fmt.Sprintf(`ALTER TABLE IF EXISTS "%s.%s" RENAME TO "%s.%s_bak_old"`, event.SchemaToWriteTo, event.TableToWriteTo, event.SchemaToWriteTo, event.TableToWriteTo))
-		_, err := em.target.Exec(fmt.Sprintf(`ALTER TABLE "%s.%s" RENAME TO "%s.%s"`, event.SchemaToWriteTo, TmpTablePfx(event.TableToWriteTo), event.SchemaToWriteTo, event.TableToWriteTo))
 		if err == nil {
-			em.target.Exec(fmt.Sprintf(`DROP TABLE "%s.%s_bak_old"`, event.SchemaToWriteTo, event.TableToWriteTo))
+			em.target.Exec(fmt.Sprintf(`ALTER TABLE IF EXISTS "%s.%s" RENAME TO "%s.%s_bak_old"`, event.SchemaToWriteTo, event.TableToWriteTo, event.SchemaToWriteTo, event.TableToWriteTo))
+			_, err := em.target.Exec(fmt.Sprintf(`ALTER TABLE "%s.%s" RENAME TO "%s.%s"`, event.SchemaToWriteTo, TmpTablePfx(event.TableToWriteTo), event.SchemaToWriteTo, event.TableToWriteTo))
+			if err == nil {
+				em.target.Exec(fmt.Sprintf(`DROP TABLE "%s.%s_bak_old"`, event.SchemaToWriteTo, event.TableToWriteTo))
+			}
 		}
+
 		fmt.Printf("Worker %d finished processing event: %v\n", workerID, event)
 
 	}
@@ -371,7 +374,6 @@ func (m *MysqlToSnowflake) GenerateTmpTables(inf []*table.Info) error {
 		for _, c := range v.Schema {
 			cols = append(cols, fmt.Sprintf(`"%s" %s`, c.ColumnName, c.TargetType))
 		}
-
 		sql := fmt.Sprintf(`
 		CREATE OR REPLACE TABLE "%s.%s" (
 			%s
