@@ -7,10 +7,9 @@ type TableInformation struct {
 }
 
 type ColumnTypes struct {
-	ColumnName    string `db:"col_name"`
-	Type          string `db:"col_type"`
-	TargetType    string `db:"target_type"`
-	TargetColName string `db:"target_col_name"`
+	ColumnName string `db:"col_name"`
+	Type       string `db:"col_type"`
+	TargetType string `db:"target_type"`
 }
 
 type Index struct {
@@ -20,11 +19,11 @@ type Index struct {
 }
 
 type Info struct {
-	TableName    string `db:"table_name"`
-	DatabaseName string `db:"db_name"`
+	TableName    string `db:"table_name" header:"table_name"`
+	DatabaseName string `db:"db_name" header:"db_name"`
 	Schema       []*ColumnTypes
 	Indexes      []*Index
-	SizeMB       float64
+	SizeMB       float64 `header:"size_mb"`
 }
 
 type InfoSortBy string

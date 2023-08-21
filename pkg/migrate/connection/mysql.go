@@ -26,6 +26,7 @@ func AddLogger(db *sql.DB, dsn string, driverName string) *sql.DB {
 }
 
 func DialMysql(dsn string, maxConc int, qlog bool) *sql.DB {
+	fmt.Println("getting DialMysql con")
 	sqlDB, err := sql.Open("mysql", dsn)
 	if err != nil {
 		panic(fmt.Errorf("MYSQL_SOURCE : Could not dial connection to mysql due to : %w", err))
@@ -35,5 +36,6 @@ func DialMysql(dsn string, maxConc int, qlog bool) *sql.DB {
 	}
 	sqlDB.SetMaxOpenConns(maxConc)
 	sqlDB.SetMaxIdleConns(maxConc)
+	fmt.Println("got DialMysql con")
 	return sqlDB
 }

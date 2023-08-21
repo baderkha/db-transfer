@@ -24,7 +24,10 @@ import (
 	"github.com/baderkha/db-transfer/pkg/migrate/table/colmap"
 	"github.com/gofrs/uuid"
 	"github.com/hashicorp/go-multierror"
+	"github.com/kataras/tablewriter"
 	"github.com/spf13/afero"
+
+	"github.com/lensesio/tableprinter"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -45,6 +48,14 @@ func NewMysqlToSnowflake() *MysqlToSnowflake {
 	if err != nil {
 		panic(err)
 	}
+	printer := tableprinter.New(os.Stdout)
+	printer.BorderTop, printer.BorderBottom, printer.BorderLeft, printer.BorderRight = true, true, true, true
+	printer.CenterSeparator = "│"
+	printer.ColumnSeparator = "│"
+	printer.RowSeparator = "─"
+	printer.HeaderBgColor = tablewriter.BgBlackColor
+	printer.HeaderFgColor = tablewriter.FgGreenColor
+
 	// Create a new S3 client
 	return &MysqlToSnowflake{
 		runId:                  uid.String(),
@@ -53,10 +64,11 @@ func NewMysqlToSnowflake() *MysqlToSnowflake {
 		fs:                     afero.NewOsFs(),
 		targetFs:               s3.New(sess),
 		safeCastQuery:          string(b),
+		tbPrinter:              printer,
 	}
 }
 
-func PrefixTableName(tableName string) string {
+func TmpTablePfx(tableName string) string {
 	return fmt.Sprintf("TEMP_MIGRATION_%s", tableName)
 }
 
@@ -85,6 +97,7 @@ type MysqlToSnowflake struct {
 	safeCastQuery          string
 	safeCols               map[string][]SafeColTypes
 	fs                     afero.Fs
+	tbPrinter              *tableprinter.Printer
 }
 
 func (m *MysqlToSnowflake) Init(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snowflake]) {
@@ -160,6 +173,7 @@ func (m *MysqlToSnowflake) Run(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snow
 				SortByDirection: table.SortDirectionDESC,
 			})
 	allTableInfo, err = m.GenerateTargetCast(allTableInfo)
+	m.tbPrinter.Print(allTableInfo)
 	if err != nil {
 		return err
 	}
@@ -170,7 +184,7 @@ func (m *MysqlToSnowflake) Run(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snow
 	}
 	m.safeCols = safeCols
 
-	err = m.GenerateTargetTables(allTableInfo)
+	err = m.GenerateTmpTables(allTableInfo)
 	if err != nil {
 		return err
 	}
@@ -332,13 +346,44 @@ func (em *MysqlToSnowflake) OnSnowflakeCSVFileEv(workerID int, wg *sync.WaitGrou
 			return
 		}
 		fmt.Printf("Worker %d received event: %v\n", workerID, event)
-		time.Sleep(1 * time.Second)
+		_, _ = em.target.Exec(fmt.Sprintf(`
+			COPY INTO "%s.%s"
+			FROM %s/%s
+		`,
+			event.SchemaToWriteTo, TmpTablePfx(event.TableToWriteTo),
+			em.cfg.Target.Stage,
+			event.S3OPrefixPathWrittenTo,
+		))
+
+		em.target.Exec(fmt.Sprintf(`ALTER TABLE IF EXISTS "%s.%s" RENAME TO "%s.%s_bak_old"`, event.SchemaToWriteTo, event.TableToWriteTo, event.SchemaToWriteTo, event.TableToWriteTo))
+		_, err := em.target.Exec(fmt.Sprintf(`ALTER TABLE "%s.%s" RENAME TO "%s.%s"`, event.SchemaToWriteTo, TmpTablePfx(event.TableToWriteTo), event.SchemaToWriteTo, event.TableToWriteTo))
+		if err == nil {
+			em.target.Exec(fmt.Sprintf(`DROP TABLE "%s.%s_bak_old"`, event.SchemaToWriteTo, event.TableToWriteTo))
+		}
 		fmt.Printf("Worker %d finished processing event: %v\n", workerID, event)
 
 	}
 }
 
-func (m *MysqlToSnowflake) GenerateTargetTables(inf []*table.Info) error {
+func (m *MysqlToSnowflake) GenerateTmpTables(inf []*table.Info) error {
+	for _, v := range inf {
+		var cols []string
+		for _, c := range v.Schema {
+			cols = append(cols, fmt.Sprintf(`"%s" %s`, c.ColumnName, c.TargetType))
+		}
+
+		sql := fmt.Sprintf(`
+		CREATE OR REPLACE TABLE "%s.%s" (
+			%s
+		)`,
+			v.DatabaseName, TmpTablePfx(v.TableName),
+			strings.Join(cols, ",\n"),
+		)
+		_, err := m.target.Exec(sql)
+		if err != nil {
+			return fmt.Errorf("COULD NOT CREATE TEMPORARY TABLE %s.%s due to %w", v.DatabaseName, v.TableName, err)
+		}
+	}
 	return nil
 }
 
@@ -363,5 +408,5 @@ func (m *MysqlToSnowflake) GenerateTargetCast(inf []*table.Info) ([]*table.Info,
 func (m *MysqlToSnowflake) CleanUp() {
 	defer close(m.snowflakeWriteListener)
 	defer m.source.Close()
-	//defer m.target.Close()
+	defer m.target.Close()
 }

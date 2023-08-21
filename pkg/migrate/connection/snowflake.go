@@ -2,11 +2,13 @@ package connection
 
 import (
 	"database/sql"
+	"fmt"
 
 	_ "github.com/snowflakedb/gosnowflake"
 )
 
 func DialSnowflake(dsn string, qlog bool) *sql.DB {
+	fmt.Println("getting DialSnowflake")
 	var res string
 	db, err := sql.Open("snowflake", dsn)
 	if err != nil {
@@ -23,7 +25,8 @@ func DialSnowflake(dsn string, qlog bool) *sql.DB {
 	}
 	row.Scan(&res)
 	if res != "1" {
-		panic("select 1 did not work for snowflake")
+		panic("can't ping snowflake via select 1")
 	}
+	fmt.Println("got DialSnowflake")
 	return db
 }

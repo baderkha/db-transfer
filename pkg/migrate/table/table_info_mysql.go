@@ -41,8 +41,7 @@ func (m *InfoFetcherMYSQL) All(f *FetchOptions) ([]*Info, error) {
     table_name
 	from information_schema.tables
 	where table_type = 'BASE TABLE'
-		and table_schema not in ('information_schema','mysql',
-								'performance_schema','sys')
+		and table_schema not in ('information_schema','mysql','performance_schema','sys')
 		order by db_name, table_name
 	`)
 		if err != nil {
