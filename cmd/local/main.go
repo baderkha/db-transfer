@@ -16,18 +16,20 @@ func main() {
 
 	startTime := time.Now()
 	var cfg config.Config[sourcecfg.MYSQL, targetcfg.Snowflake]
+
 	b, err := os.ReadFile("job.json")
 	if err != nil {
 		panic(err)
 	}
+
 	err = json.Unmarshal(b, &cfg)
 	if err != nil {
 		panic(err)
 	}
+	endTime := time.Now()
 	migrate.
 		NewMysqlToSnowflake().
 		Run(cfg)
-	endTime := time.Now()
 
 	// Calculate the time taken
 	elapsedTime := endTime.Sub(startTime)
