@@ -77,6 +77,7 @@ func UnPrefixTableName(prefixedTName string) string {
 }
 
 type snowflakeTargetEv struct {
+	LocalPathWrittenTo     string
 	S3OPrefixPathWrittenTo string
 	TableToWriteTo         string
 	SchemaToWriteTo        string
@@ -107,7 +108,6 @@ func (m *MysqlToSnowflake) Init(cfg config.Config[sourcecfg.MYSQL, targetcfg.Sno
 	m.infoFetcher = table.NewInfoFetcherMysql(m.source)
 	m.tmpDirPrefix = filepath.Join(conditional.Ternary(os.Getenv("WRITE_DIR") != "", os.Getenv("WRITE_DIR"), "./tmp"), "date="+time.Now().Format(time.DateOnly), "run_id="+m.runId)
 	m.s3DirPrefix = filepath.Join(conditional.Ternary(m.cfg.Target.S3.PrefixOverride != "", m.cfg.Target.S3.PrefixOverride, "./mysql_snowflake_migration"), "date="+time.Now().Format(time.DateOnly), "run_id="+m.runId)
-
 }
 
 // table_schema as db_name,
@@ -164,7 +164,7 @@ func (m *MysqlToSnowflake) Run(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snow
 	sourceWg.SetLimit(m.cfg.MaxConcurrency)
 	// listener will be running in the bg waiting for files to be written
 	m.ListenToSnowflakeFiles(&sflakeWg)
-
+	fmt.Println("Fetching all table information ...")
 	allTableInfo, err :=
 		m.
 			infoFetcher.
@@ -322,6 +322,7 @@ func (m *MysqlToSnowflake) HandleTableDump(a *table.Info) error {
 		TableToWriteTo:         a.TableName,
 		SchemaToWriteTo:        a.DatabaseName,
 		S3OPrefixPathWrittenTo: filepath.Join(m.s3DirPrefix, subPrefix),
+		LocalPathWrittenTo:     prefix,
 	})
 	fmt.Println("here after publish " + a.TableName + " " + a.DatabaseName)
 	return nil
@@ -359,7 +360,11 @@ func (em *MysqlToSnowflake) OnSnowflakeCSVFileEv(workerID int, wg *sync.WaitGrou
 			em.target.Exec(fmt.Sprintf(`ALTER TABLE IF EXISTS "%s.%s" RENAME TO "%s.%s_bak_old"`, event.SchemaToWriteTo, event.TableToWriteTo, event.SchemaToWriteTo, event.TableToWriteTo))
 			_, err := em.target.Exec(fmt.Sprintf(`ALTER TABLE "%s.%s" RENAME TO "%s.%s"`, event.SchemaToWriteTo, TmpTablePfx(event.TableToWriteTo), event.SchemaToWriteTo, event.TableToWriteTo))
 			if err == nil {
-				em.target.Exec(fmt.Sprintf(`DROP TABLE "%s.%s_bak_old"`, event.SchemaToWriteTo, event.TableToWriteTo))
+				err := em.fs.RemoveAll(event.LocalPathWrittenTo)
+				if err != nil {
+					fmt.Println(err)
+				}
+				em.target.Exec(fmt.Sprintf(`DROP TABLE IF EXISTS "%s.%s_bak_old"`, event.SchemaToWriteTo, event.TableToWriteTo))
 			}
 		}
 

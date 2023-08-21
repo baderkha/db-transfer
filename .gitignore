@@ -2,3 +2,10 @@ tmp
 *.csv
 local/*
 main1.go
+ssh.sh
+test_run.json
+.env
+./build/*
+db_transfer
+job.json
+build/resources

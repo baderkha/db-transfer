@@ -45,6 +45,7 @@ var (
 		"MEDIUMINT":          "NUMBER",
 		"BIGINT":             "NUMBER",
 		"BIT":                "BOOLEAN",
+		"YEAR":               "INT",
 		"DECIMAL":            "FLOAT",
 		"DOUBLE":             "FLOAT",
 		"FLOAT":              "FLOAT",

@@ -130,7 +130,7 @@ func (m *InfoFetcherMYSQL) GetAllTableSizes() []*mysqlTableSizes {
 
 func (m *InfoFetcherMYSQL) GetTableInfo(dbName string, table string) []*ColumnTypes {
 	var res []*ColumnTypes
-	rows, err := m.source.Query(`SELECT COLUMN_NAME AS col_name, COLUMN_TYPE AS col_type
+	rows, err := m.source.Query(`SELECT COLUMN_NAME AS col_name, DATA_TYPE AS col_type
 	FROM information_schema.COLUMNS  
 	WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`, dbName, table)
 	if err != nil {

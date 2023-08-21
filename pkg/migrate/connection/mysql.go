@@ -36,6 +36,10 @@ func DialMysql(dsn string, maxConc int, qlog bool) *sql.DB {
 	}
 	sqlDB.SetMaxOpenConns(maxConc)
 	sqlDB.SetMaxIdleConns(maxConc)
+	_, err = sqlDB.Query("SELECT 1")
+	if err != nil {
+		panic(err)
+	}
 	fmt.Println("got DialMysql con")
 	return sqlDB
 }
