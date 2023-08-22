@@ -20,21 +20,25 @@ import (
 	"github.com/baderkha/db-transfer/pkg/migrate/config/sourcecfg"
 	"github.com/baderkha/db-transfer/pkg/migrate/config/targetcfg"
 	"github.com/baderkha/db-transfer/pkg/migrate/connection"
+	"github.com/baderkha/db-transfer/pkg/migrate/state"
 	"github.com/baderkha/db-transfer/pkg/migrate/table/colmap"
-	"github.com/gofrs/uuid"
 	"github.com/hashicorp/go-multierror"
 	"github.com/kataras/tablewriter"
 	"github.com/spf13/afero"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 
 	"github.com/lensesio/tableprinter"
 	"golang.org/x/sync/errgroup"
 )
 
 func NewMysqlToSnowflake() *MysqlToSnowflake {
-	uid, err := uuid.NewV4()
+	db, err := gorm.Open(sqlite.Open("mydb.sqlite"), &gorm.Config{})
 	if err != nil {
+		fmt.Println("Error:", err)
 		panic(err)
 	}
+
 	sess, err := session.NewSession(&aws.Config{
 		Region: aws.String("us-east-1"), // Specify your desired AWS region
 	})
@@ -57,7 +61,6 @@ func NewMysqlToSnowflake() *MysqlToSnowflake {
 
 	// Create a new S3 client
 	return &MysqlToSnowflake{
-		runId:                  uid.String(),
 		snowflakeWriteListener: make(chan snowflakeTargetEv),
 		errWriteList:           make(chan error),
 		fs:                     afero.NewOsFs(),
@@ -81,6 +84,7 @@ type snowflakeTargetEv struct {
 	TableToWriteTo         string
 	SchemaToWriteTo        string
 	Die                    bool
+	RowsWritten            int
 }
 
 type MysqlToSnowflake struct {
@@ -94,17 +98,40 @@ type MysqlToSnowflake struct {
 	s3DirPrefix            string
 	runId                  string
 	safeCastQuery          string
-	safeCols               map[string][]SafeColTypes
+	dbColMap               map[string][]SafeColTypes
 	fs                     afero.Fs
 	tbPrinter              *tableprinter.Printer
+	stateMgr               state.Manager
 }
 
-func (m *MysqlToSnowflake) Init(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snowflake]) {
+func (m *MysqlToSnowflake) Init(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snowflake]) error {
 	m.cfg = cfg
+
 	m.source = connection.DialMysql(cfg.SourceConfig.GetDSN(), cfg.MaxConcurrency, cfg.SourceConfig.QueryLogging)
 	m.target = connection.DialSnowflake(cfg.Target.GetDSN(), cfg.Target.QueryLogging)
-	m.tmpDirPrefix = filepath.Join(conditional.Ternary(os.Getenv("WRITE_DIR") != "", os.Getenv("WRITE_DIR"), "./tmp"), "date="+time.Now().Format(time.DateOnly), "run_id="+m.runId)
+
 	m.s3DirPrefix = filepath.Join(conditional.Ternary(m.cfg.Target.S3.PrefixOverride != "", m.cfg.Target.S3.PrefixOverride, "./mysql_snowflake_migration"), "date="+time.Now().Format(time.DateOnly), "run_id="+m.runId)
+	dbColMap, err := m.GetSafeColTypes()
+	if err != nil {
+		return fmt.Errorf("Could not read tap schema config due to %w", err)
+	}
+	m.dbColMap = dbColMap
+	m.runId = m.stateMgr.InitRunLog(len(dbColMap))
+	m.tmpDirPrefix = filepath.Join(conditional.Ternary(os.Getenv("WRITE_DIR") != "", os.Getenv("WRITE_DIR"), "./tmp"), "date="+time.Now().Format(time.DateOnly), "run_id="+m.runId)
+
+	err = m.fs.MkdirAll(m.tmpDirPrefix, 0755)
+	if err != nil {
+		return err
+	}
+
+	// create table states
+	err = m.InitTableRunState(dbColMap)
+	if err != nil {
+		return err
+	}
+
+	return nil
+
 }
 
 // table_schema as db_name,
@@ -149,30 +176,28 @@ func (m *MysqlToSnowflake) GetSafeColTypes() (map[string][]SafeColTypes, error) 
 }
 
 func (m *MysqlToSnowflake) Run(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snowflake]) error {
+	err := m.Init(cfg)
+	if err != nil {
+		return err
+	}
 	var (
 		sflakeWg sync.WaitGroup
 		sourceWg errgroup.Group
+		dbColMap = m.dbColMap
 	)
-	m.Init(cfg)
+
 	defer m.CleanUp()
-	err := m.fs.MkdirAll(m.tmpDirPrefix, 0755)
-	if err != nil {
-		return err
-	}
+
 	sourceWg.SetLimit(m.cfg.MaxConcurrency)
 	// listener will be running in the bg waiting for files to be written
 	m.ListenToSnowflakeFiles(&sflakeWg)
-	dbColMap, err := m.GetSafeColTypes()
-	if err != nil {
-		return err
-	}
-	fmt.Println("Fetching all table information ...")
+
 	dbColMap, err = m.GenerateTargetCast(dbColMap)
 	if err != nil {
 		return err
 	}
 
-	m.safeCols = dbColMap
+	m.dbColMap = dbColMap
 
 	err = m.GenerateTmpTables(dbColMap)
 	if err != nil {
@@ -182,18 +207,41 @@ func (m *MysqlToSnowflake) Run(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snow
 	for k, v := range dbColMap {
 		sourceWg.Go(func(k string, v []SafeColTypes) func() error {
 			return func() error {
-				return m.HandleTableDump(k, v)
+				dbName, tbName := m.parseTBNameFromMapKey(k)
+				err := m.HandleTableDump(k, v)
+				if err != nil {
+					m.stateMgr.FailedTableRun(m.runId, dbName, tbName, fmt.Errorf("Failed Streaming Table to File : %w", err))
+					return err
+				}
+				return nil
 			}
 		}(k, v))
 	}
 
 	err = sourceWg.Wait()
 	if err != nil {
+		m.stateMgr.FailedRunLog(m.runId, fmt.Errorf("Failed Table Streaming due to : %w", err))
 		return err
 	}
 	fmt.Println("finished streaming tables")
 	m.ShutSflakeDownWorkers()
 	sflakeWg.Wait() // wait once the other is done
+	if !m.stateMgr.DidTableFailForRun(m.runId) {
+		m.stateMgr.PassedRunLog(m.runId)
+	}
+	return nil
+}
+
+func (m *MysqlToSnowflake) InitTableRunState(dbColMap map[string][]SafeColTypes) error {
+	for k := range dbColMap {
+		dbName, tbName := m.parseTBNameFromMapKey(k)
+		m.stateMgr.InitTableRunLog(m.runId, dbName, tbName)
+
+	}
+
+	if len(m.stateMgr.GetTableRunLogs(m.runId)) != len(dbColMap) {
+		return fmt.Errorf("State Error, tables in state != len of tables to sync")
+	}
 	return nil
 }
 
@@ -224,6 +272,7 @@ func (m *MysqlToSnowflake) HandleTableDump(DBTableName string, safeCols []SafeCo
 		currentFileName string = fmt.Sprintf("%s_%d.csv", TBName, batchAt)
 		err             error
 		wg              errgroup.Group
+		rowsWritten     int
 	)
 	wg.SetLimit(m.cfg.MaxConcurrency)
 	for _, col := range safeCols {
@@ -253,6 +302,7 @@ func (m *MysqlToSnowflake) HandleTableDump(DBTableName string, safeCols []SafeCo
 	isLastRow := !rows.Next()
 	for !isLastRow {
 		ctr += 1
+		rowsWritten += 1
 
 		if err := rows.Scan(result...); err != nil {
 			log.Fatal("Error scanning row:", err)
@@ -314,6 +364,7 @@ func (m *MysqlToSnowflake) HandleTableDump(DBTableName string, safeCols []SafeCo
 		SchemaToWriteTo:        DBName,
 		S3OPrefixPathWrittenTo: filepath.Join(m.s3DirPrefix, subPrefix),
 		LocalPathWrittenTo:     prefix,
+		RowsWritten:            rowsWritten,
 	})
 	fmt.Println("here after publish " + TBName + " " + DBName)
 	return nil
@@ -339,29 +390,36 @@ func (em *MysqlToSnowflake) OnSnowflakeCSVFileEv(workerID int, wg *sync.WaitGrou
 			return
 		}
 		fmt.Printf("Worker %d received event: %v\n", workerID, event)
-		_, err := em.target.Exec(fmt.Sprintf(`
+		err := em.handleSnowflakeEv(event)
+		if err != nil {
+			em.stateMgr.FailedTableRun(em.runId, event.SchemaToWriteTo, event.TableToWriteTo, fmt.Errorf("Failed Writing to Snowflake due to %w", err))
+		} else {
+			em.stateMgr.PassedTableRun(em.runId, event.SchemaToWriteTo, event.TableToWriteTo, event.RowsWritten)
+		}
+		fmt.Printf("Worker %d finished processing event: %v\n", workerID, event)
+	}
+}
+
+func (em *MysqlToSnowflake) handleSnowflakeEv(event snowflakeTargetEv) error {
+	defer em.fs.RemoveAll(event.LocalPathWrittenTo)
+	_, err := em.target.Exec(fmt.Sprintf(`
 			COPY INTO "%s.%s"
 			FROM %s/%s/
 		`,
-			event.SchemaToWriteTo, TmpTablePfx(event.TableToWriteTo),
-			em.cfg.Target.Stage,
-			event.S3OPrefixPathWrittenTo,
-		))
-		if err == nil {
-			em.target.Exec(fmt.Sprintf(`ALTER TABLE IF EXISTS "%s.%s" RENAME TO "%s.%s_bak_old"`, event.SchemaToWriteTo, event.TableToWriteTo, event.SchemaToWriteTo, event.TableToWriteTo))
-			_, err := em.target.Exec(fmt.Sprintf(`ALTER TABLE "%s.%s" RENAME TO "%s.%s"`, event.SchemaToWriteTo, TmpTablePfx(event.TableToWriteTo), event.SchemaToWriteTo, event.TableToWriteTo))
-			if err == nil {
-				err := em.fs.RemoveAll(event.LocalPathWrittenTo)
-				if err != nil {
-					fmt.Println(err)
-				}
-				em.target.Exec(fmt.Sprintf(`DROP TABLE IF EXISTS "%s.%s_bak_old"`, event.SchemaToWriteTo, event.TableToWriteTo))
-			}
-		}
-
-		fmt.Printf("Worker %d finished processing event: %v\n", workerID, event)
-
+		event.SchemaToWriteTo, TmpTablePfx(event.TableToWriteTo),
+		em.cfg.Target.Stage,
+		event.S3OPrefixPathWrittenTo,
+	))
+	if err != nil {
+		return err
 	}
+	em.target.Exec(fmt.Sprintf(`ALTER TABLE IF EXISTS "%s.%s" RENAME TO "%s.%s_bak_old"`, event.SchemaToWriteTo, event.TableToWriteTo, event.SchemaToWriteTo, event.TableToWriteTo))
+	_, err = em.target.Exec(fmt.Sprintf(`ALTER TABLE "%s.%s" RENAME TO "%s.%s"`, event.SchemaToWriteTo, TmpTablePfx(event.TableToWriteTo), event.SchemaToWriteTo, event.TableToWriteTo))
+	if err != nil {
+		return fmt.Errorf(`Could not Rename Table from "%s.%s" RENAME TO "%s.%s" due to : %w`, event.SchemaToWriteTo, TmpTablePfx(event.TableToWriteTo), event.SchemaToWriteTo, event.TableToWriteTo, err)
+	}
+	_, _ = em.target.Exec(fmt.Sprintf(`DROP TABLE IF EXISTS "%s.%s_bak_old"`, event.SchemaToWriteTo, event.TableToWriteTo))
+	return nil
 }
 
 func (m *MysqlToSnowflake) parseTBNameFromMapKey(mapKey string) (db string, table string) {
