@@ -9,3 +9,5 @@ test_run.json
 db_transfer
 job.json
 build/resources
+*.sqlite
+./build/mydb.sqlite

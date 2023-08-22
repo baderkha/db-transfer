@@ -17,8 +17,9 @@ type Base struct {
 }
 
 type RunLog struct {
-	RunID                 int         `json:"run_id" db:"run_id" gorm:"primaryKey;autoIncrement"`
-	TotalTablesForThisRun int         `json:"total_tables_for_run" db:"total_tables_for_run"`
+	RunID                 int `json:"run_id" db:"run_id" gorm:"primaryKey;autoIncrement"`
+	TotalTablesForThisRun int `json:"total_tables_for_run" db:"total_tables_for_run"`
+	ErrMsg                string
 	Status                RunLogState `json:"status" db:"status" gorm:"type:varchar(50)"`
 	Base
 }
@@ -29,12 +30,13 @@ type TableRunLog struct {
 	TableName   string      `json:"table_name" db:"table_name" gorm:"type:varchar(255)"`
 	RowWritten  int         `json:"rows_written_target" gorm:"type:int(11)"`
 	Status      RunLogState `gorm:"type:varchar(50)"`
+	ErrMsg      string
 	Base
 }
 
 type Manager interface {
 	// This should sort by most recent first
-	GetLastRun() *TableRunLog
+	GetLastRun() *RunLog
 	// GetRunLog : GetRunLog get a specific run log
 	GetRunLog(runID string) *RunLog
 	GetTableRunLogs(runID string) []*TableRunLog
@@ -46,4 +48,5 @@ type Manager interface {
 	FailedTableRun(runID string, dbName string, tableName string, err error)
 	PassedTableRun(runID string, dbName string, tableName string, rowsWritten int)
 	DidTableFailForRun(runID string) bool
+	OnShutDownEv()
 }

@@ -25,19 +25,12 @@ import (
 	"github.com/hashicorp/go-multierror"
 	"github.com/kataras/tablewriter"
 	"github.com/spf13/afero"
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
 
 	"github.com/lensesio/tableprinter"
 	"golang.org/x/sync/errgroup"
 )
 
 func NewMysqlToSnowflake() *MysqlToSnowflake {
-	db, err := gorm.Open(sqlite.Open("mydb.sqlite"), &gorm.Config{})
-	if err != nil {
-		fmt.Println("Error:", err)
-		panic(err)
-	}
 
 	sess, err := session.NewSession(&aws.Config{
 		Region: aws.String("us-east-1"), // Specify your desired AWS region
@@ -67,6 +60,7 @@ func NewMysqlToSnowflake() *MysqlToSnowflake {
 		targetFs:               s3.New(sess),
 		safeCastQuery:          string(b),
 		tbPrinter:              printer,
+		stateMgr:               state.NewSqliteGormManager(),
 	}
 }
 
@@ -102,6 +96,10 @@ type MysqlToSnowflake struct {
 	fs                     afero.Fs
 	tbPrinter              *tableprinter.Printer
 	stateMgr               state.Manager
+}
+
+func (m *MysqlToSnowflake) GetStateManager() state.Manager {
+	return m.stateMgr
 }
 
 func (m *MysqlToSnowflake) Init(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snowflake]) error {
