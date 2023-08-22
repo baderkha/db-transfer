@@ -3,6 +3,7 @@ package migrate
 import (
 	"database/sql"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -113,6 +114,13 @@ func (m *MysqlToSnowflake) Init(cfg config.Config[sourcecfg.MYSQL, targetcfg.Sno
 	if err != nil {
 		return fmt.Errorf("Could not read tap schema config due to %w", err)
 	}
+	if !cfg.SourceConfig.AllTables {
+		dbColMap = m.getFilteredTableList(dbColMap)
+	}
+
+	if len(dbColMap) == 0 {
+		return errors.New("No Tables to sync make sure your table config is valid")
+	}
 	m.dbColMap = dbColMap
 	m.runId = m.stateMgr.InitRunLog(len(dbColMap))
 	m.tmpDirPrefix = filepath.Join(conditional.Ternary(os.Getenv("WRITE_DIR") != "", os.Getenv("WRITE_DIR"), "./tmp"), "date="+time.Now().Format(time.DateOnly), "run_id="+m.runId)
@@ -130,6 +138,20 @@ func (m *MysqlToSnowflake) Init(cfg config.Config[sourcecfg.MYSQL, targetcfg.Sno
 
 	return nil
 
+}
+
+func (m *MysqlToSnowflake) getFilteredTableList(dbColMap map[string][]SafeColTypes) map[string][]SafeColTypes {
+	var filteredListOfTables map[string][]SafeColTypes = make(map[string][]SafeColTypes)
+	for _, v := range m.cfg.SourceConfig.TableList {
+		cols, ok := dbColMap[v.JoinName()]
+		if ok {
+			filteredListOfTables[v.JoinName()] = cols
+		} else {
+			fmt.Printf("Warning : %s does not exist in the schema omitting ....\n", v.JoinName())
+		}
+	}
+	dbColMap = filteredListOfTables
+	return dbColMap
 }
 
 // table_schema as db_name,
