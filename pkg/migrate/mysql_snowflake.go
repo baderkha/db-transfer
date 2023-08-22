@@ -20,7 +20,6 @@ import (
 	"github.com/baderkha/db-transfer/pkg/migrate/config/sourcecfg"
 	"github.com/baderkha/db-transfer/pkg/migrate/config/targetcfg"
 	"github.com/baderkha/db-transfer/pkg/migrate/connection"
-	"github.com/baderkha/db-transfer/pkg/migrate/table"
 	"github.com/baderkha/db-transfer/pkg/migrate/table/colmap"
 	"github.com/gofrs/uuid"
 	"github.com/hashicorp/go-multierror"
@@ -88,7 +87,6 @@ type MysqlToSnowflake struct {
 	source                 *sql.DB
 	target                 *sql.DB
 	targetFs               s3iface.S3API
-	infoFetcher            table.InfoFetcher
 	cfg                    config.Config[sourcecfg.MYSQL, targetcfg.Snowflake]
 	snowflakeWriteListener chan snowflakeTargetEv
 	errWriteList           chan error
@@ -105,7 +103,6 @@ func (m *MysqlToSnowflake) Init(cfg config.Config[sourcecfg.MYSQL, targetcfg.Sno
 	m.cfg = cfg
 	m.source = connection.DialMysql(cfg.SourceConfig.GetDSN(), cfg.MaxConcurrency, cfg.SourceConfig.QueryLogging)
 	m.target = connection.DialSnowflake(cfg.Target.GetDSN(), cfg.Target.QueryLogging)
-	m.infoFetcher = table.NewInfoFetcherMysql(m.source)
 	m.tmpDirPrefix = filepath.Join(conditional.Ternary(os.Getenv("WRITE_DIR") != "", os.Getenv("WRITE_DIR"), "./tmp"), "date="+time.Now().Format(time.DateOnly), "run_id="+m.runId)
 	m.s3DirPrefix = filepath.Join(conditional.Ternary(m.cfg.Target.S3.PrefixOverride != "", m.cfg.Target.S3.PrefixOverride, "./mysql_snowflake_migration"), "date="+time.Now().Format(time.DateOnly), "run_id="+m.runId)
 }
@@ -124,6 +121,7 @@ type SafeColTypes struct {
 	DataType   string
 	ColumnType string
 	SafeSQL    string
+	TargetType string
 }
 
 func (m *MysqlToSnowflake) GetSafeColTypes() (map[string][]SafeColTypes, error) {
@@ -164,37 +162,29 @@ func (m *MysqlToSnowflake) Run(cfg config.Config[sourcecfg.MYSQL, targetcfg.Snow
 	sourceWg.SetLimit(m.cfg.MaxConcurrency)
 	// listener will be running in the bg waiting for files to be written
 	m.ListenToSnowflakeFiles(&sflakeWg)
+	dbColMap, err := m.GetSafeColTypes()
+	if err != nil {
+		return err
+	}
 	fmt.Println("Fetching all table information ...")
-	allTableInfo, err :=
-		m.
-			infoFetcher.
-			All(&table.FetchOptions{
-				SortByCol:       table.SortBySize,
-				SortByDirection: table.SortDirectionDESC,
-			})
-	allTableInfo, err = m.GenerateTargetCast(allTableInfo)
-	m.tbPrinter.Print(allTableInfo)
+	dbColMap, err = m.GenerateTargetCast(dbColMap)
 	if err != nil {
 		return err
 	}
 
-	safeCols, err := m.GetSafeColTypes()
-	if err != nil {
-		return err
-	}
-	m.safeCols = safeCols
+	m.safeCols = dbColMap
 
-	err = m.GenerateTmpTables(allTableInfo)
+	err = m.GenerateTmpTables(dbColMap)
 	if err != nil {
 		return err
 	}
 
-	for _, v := range allTableInfo {
-		sourceWg.Go(func(info *table.Info) func() error {
+	for k, v := range dbColMap {
+		sourceWg.Go(func(k string, v []SafeColTypes) func() error {
 			return func() error {
-				return m.HandleTableDump(info)
+				return m.HandleTableDump(k, v)
 			}
-		}(v))
+		}(k, v))
 	}
 
 	err = sourceWg.Wait()
@@ -219,22 +209,23 @@ func (m *MysqlToSnowflake) ShutSflakeDownWorkers() {
 	}
 }
 
-func (m *MysqlToSnowflake) HandleTableDump(a *table.Info) error {
-	fmt.Printf("STREAMING TABLE %s.%s \n", a.DatabaseName, a.TableName)
+func (m *MysqlToSnowflake) HandleTableDump(DBTableName string, safeCols []SafeColTypes) error {
+
+	fmt.Printf("STREAMING TABLE %s \n", DBTableName)
 	var (
+		DBName, TBName  = m.parseTBNameFromMapKey(DBTableName)
 		result          []interface{}
 		batchAt         = 0
 		ctr             = 0
 		currentFile     afero.File
-		subPrefix       = filepath.Join("db="+a.DatabaseName, "tb_name="+a.TableName)
+		subPrefix       = filepath.Join("db="+DBName, "tb_name="+TBName)
 		prefix          = filepath.Join(m.tmpDirPrefix, subPrefix)
 		cols            []string
-		currentFileName string = fmt.Sprintf("%s_%d.csv", a.TableName, batchAt)
+		currentFileName string = fmt.Sprintf("%s_%d.csv", TBName, batchAt)
 		err             error
 		wg              errgroup.Group
 	)
 	wg.SetLimit(m.cfg.MaxConcurrency)
-	safeCols := m.safeCols[a.DatabaseName+"."+a.TableName]
 	for _, col := range safeCols {
 		cols = append(cols, col.SafeSQL)
 	}
@@ -246,7 +237,7 @@ func (m *MysqlToSnowflake) HandleTableDump(a *table.Info) error {
 	}
 	csvWriter := csv.NewWriter(currentFile)
 
-	rows, err := m.source.Query(fmt.Sprintf(`SELECT %s FROM %s WHERE 1=1`, strings.Join(cols, ","), WrapQ(a.DatabaseName)+"."+WrapQ(a.TableName)))
+	rows, err := m.source.Query(fmt.Sprintf(`SELECT %s FROM %s WHERE 1=1`, strings.Join(cols, ","), WrapQ(DBName)+"."+WrapQ(TBName)))
 	if err != nil {
 		return err
 	}
@@ -299,7 +290,7 @@ func (m *MysqlToSnowflake) HandleTableDump(a *table.Info) error {
 			if !isLastRow {
 				ctr = 0
 				batchAt += m.cfg.BatchRecordSize
-				currentFileName = fmt.Sprintf("%s_%d.csv", a.TableName, batchAt)
+				currentFileName = fmt.Sprintf("%s_%d.csv", TBName, batchAt)
 				currentFile, err = m.fs.Create(filepath.Join(prefix, currentFileName))
 				if err != nil {
 					return err
@@ -316,15 +307,15 @@ func (m *MysqlToSnowflake) HandleTableDump(a *table.Info) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println("here before publish " + a.TableName + " " + a.DatabaseName)
+	fmt.Println("here before publish " + TBName + " " + DBName)
 	// done processing this table
 	m.PublishSnowflakeWriteEv(snowflakeTargetEv{
-		TableToWriteTo:         a.TableName,
-		SchemaToWriteTo:        a.DatabaseName,
+		TableToWriteTo:         TBName,
+		SchemaToWriteTo:        DBName,
 		S3OPrefixPathWrittenTo: filepath.Join(m.s3DirPrefix, subPrefix),
 		LocalPathWrittenTo:     prefix,
 	})
-	fmt.Println("here after publish " + a.TableName + " " + a.DatabaseName)
+	fmt.Println("here after publish " + TBName + " " + DBName)
 	return nil
 }
 
@@ -373,38 +364,55 @@ func (em *MysqlToSnowflake) OnSnowflakeCSVFileEv(workerID int, wg *sync.WaitGrou
 	}
 }
 
-func (m *MysqlToSnowflake) GenerateTmpTables(inf []*table.Info) error {
-	for _, v := range inf {
-		var cols []string
-		for _, c := range v.Schema {
-			cols = append(cols, fmt.Sprintf(`"%s" %s`, c.ColumnName, c.TargetType))
-		}
-		sql := fmt.Sprintf(`
-		CREATE OR REPLACE TABLE "%s.%s" (
-			%s
-		)`,
-			v.DatabaseName, TmpTablePfx(v.TableName),
-			strings.Join(cols, ",\n"),
-		)
-		_, err := m.target.Exec(sql)
-		if err != nil {
-			return fmt.Errorf("COULD NOT CREATE TEMPORARY TABLE %s.%s due to %w", v.DatabaseName, v.TableName, err)
-		}
-	}
-	return nil
+func (m *MysqlToSnowflake) parseTBNameFromMapKey(mapKey string) (db string, table string) {
+	ar := strings.Split(mapKey, ".")
+	return ar[0], ar[1]
 }
 
-func (m *MysqlToSnowflake) GenerateTargetCast(inf []*table.Info) ([]*table.Info, error) {
+func (m *MysqlToSnowflake) GenerateTmpTables(inf map[string][]SafeColTypes) error {
+	var (
+		wg errgroup.Group
+	)
+	wg.SetLimit(4) // no more than 4 go routines
+	for k, v := range inf {
+		wg.Go(func(k string, v []SafeColTypes) func() error {
+			return func() error {
+				var cols []string
+				for _, c := range v {
+					cols = append(cols, fmt.Sprintf(`"%s" %s`, c.ColumnName, c.TargetType))
+				}
+				sql := fmt.Sprintf(`
+			CREATE OR REPLACE TABLE "%s" (
+				%s
+			)`,
+					k,
+					strings.Join(cols, ",\n"),
+				)
+				_, err := m.target.Exec(sql)
+				if err != nil {
+					return fmt.Errorf("COULD NOT CREATE TEMPORARY TABLE %s due to %w", k, err)
+				}
+				return nil
+			}
+		}(k, v),
+		)
+
+	}
+	return wg.Wait()
+}
+
+func (m *MysqlToSnowflake) GenerateTargetCast(inf map[string][]SafeColTypes) (map[string][]SafeColTypes, error) {
 	var finalErr error
-	for _, v := range inf {
-		for i := range v.Schema {
-			convertedField, err := colmap.Convert(colmap.MysqlToSnowflake, v.Schema[i].Type)
+	for k, v := range inf {
+		for i := range v {
+			convertedField, err := colmap.Convert(colmap.MysqlToSnowflake, v[i].DataType)
 			if err != nil {
-				finalErr = multierror.Append(finalErr, fmt.Errorf("Cast Error : Bad Casting for %s.%s for column %s due to : %w", v.DatabaseName, v.TableName, v.Schema[i].ColumnName, err))
+				finalErr = multierror.Append(finalErr, fmt.Errorf("Cast Error : Bad Casting for %s for column %s due to : %w", k, v[i].ColumnName, err))
 				continue
 			}
-			v.Schema[i].TargetType = convertedField
+			v[i].TargetType = convertedField
 		}
+		inf[k] = v
 	}
 	if finalErr != nil {
 		return nil, finalErr
