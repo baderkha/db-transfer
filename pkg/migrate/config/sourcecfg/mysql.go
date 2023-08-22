@@ -7,6 +7,7 @@ import (
 type MYSQL struct {
 	SessionVariableValues map[string]string `json:"session_vars"`
 	TableList             []string          `json:"table_list"`
+	AllTables             bool              `json:"all_tables"`
 	Host                  string            `json:"host"`
 	UserName              string            `json:"user_name"`
 	Password              string            `json:"password"`
